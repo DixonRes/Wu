@@ -15,7 +15,11 @@
  *   3. 子系统去重 + DFS 工作队列 + 处理上限，防止分支爆炸。
  *   4. 伪除快速路径：初式为常数时用标量逆元，避免整体乘法导致项数膨胀。
  *   5. 可选 -f：利用 x^p = x（只求 F_p 有理点时成立）直接把所有指数
- *      约化到 < p，超高次输入（如 x^100000）立即降为低次。
+ *      约化到 < p，超高次输入（如 x^100000）立即降为低次；开启后
+ *      特征列内部产生的伪除余式同样即时约化（Gao-Huang 有限域
+ *      特征列方法的核心技巧，JSC 2012）。
+ *   6. 最优先队列：每次处理"最小"（总项数最少）的子系统，
+ *      尽早发现矛盾分支与简单分量；伪除带整除快速路径。
  *
  * 用法:
  *   ./wu_charset [k] [p] [-f]
@@ -178,6 +182,41 @@ static int syslist_pop(polyset_t *out, syslist_t *Q)
     return 1;
 }
 
+/* 系统代价：总项数 + 多项式个数（越小越先处理，尽早得到简单分支/矛盾） */
+static slong system_cost(const polyset_t *S, const nmod_mpoly_ctx_t ctx)
+{
+    slong i, c = S->len;
+    for (i = 0; i < S->len; i++)
+        c += nmod_mpoly_length(S->p + i, ctx);
+    return c;
+}
+
+/* 最优先弹出：取代价最小的系统 */
+static int syslist_pop_best(polyset_t *out, syslist_t *Q,
+                            const nmod_mpoly_ctx_t ctx)
+{
+    slong i, best = 0;
+    slong bc, c;
+    polyset_t tmp;
+
+    if (Q->len == 0)
+        return 0;
+    bc = system_cost(Q->sys, ctx);
+    for (i = 1; i < Q->len; i++)
+    {
+        c = system_cost(Q->sys + i, ctx);
+        if (c < bc)
+        {
+            bc = c;
+            best = i;
+        }
+    }
+    tmp = Q->sys[best];
+    Q->sys[best] = Q->sys[Q->len - 1];
+    Q->sys[Q->len - 1] = tmp;
+    return syslist_pop(out, Q);
+}
+
 static int syslist_contains(const syslist_t *Q, const polyset_t *S,
                             const nmod_mpoly_ctx_t ctx)
 {
@@ -266,6 +305,19 @@ static void poly_prem(nmod_mpoly_t r, const nmod_mpoly_t f,
     {
         nmod_mpoly_set(r, f, ctx);
         return;
+    }
+
+    /* 快速路径：g | f 时余式为零（nmod_mpoly_divides 很快判定） */
+    {
+        nmod_mpoly_t q;
+        nmod_mpoly_init(q, ctx);
+        if (nmod_mpoly_divides(q, f, g, ctx))
+        {
+            nmod_mpoly_zero(r, ctx);
+            nmod_mpoly_clear(q, ctx);
+            return;
+        }
+        nmod_mpoly_clear(q, ctx);
     }
 
     nmod_mpoly_init(lg, ctx);
@@ -558,7 +610,7 @@ static void basic_set(polyset_t *B, const polyset_t *P,
  * 正常收敛时 CS = B。
  */
 static int char_set_split(polyset_t *CS, const polyset_t *F, syslist_t *Q,
-                          const nmod_mpoly_ctx_t ctx)
+                          int field_reduce, const nmod_mpoly_ctx_t ctx)
 {
     polyset_t P;
     nmod_mpoly_t r;
@@ -601,9 +653,11 @@ static int char_set_split(polyset_t *CS, const polyset_t *F, syslist_t *Q,
                 continue;
 
             poly_prem_chain(r, P.p + i, CS, ctx);
+            if (field_reduce)   /* x^p = x 约化余式，控制次数（保 F_p 零点） */
+                field_reduce_exponents(r, r, ctx);
             if (nmod_mpoly_is_zero(r, ctx))
                 continue;
-            if (nmod_mpoly_is_ui(r, ctx))   /* 非零常数 ∈ ideal(P)：矛盾 */
+            if (nmod_mpoly_is_ui(r, ctx))   /* 非零常数：本分支无 F_p 零点 */
             {
                 ret = SYS_CONTRA;
                 goto done;
@@ -905,7 +959,7 @@ static void wu_solve(const polyset_t *F_orig, sol_list_t *out,
     syslist_init(&processed);
     syslist_push(&queue, F_orig, ctx);
 
-    while (syslist_pop(&P, &queue))
+    while (syslist_pop_best(&P, &queue, ctx))
     {
         polyset_t CS;
         int st;
@@ -940,7 +994,7 @@ static void wu_solve(const polyset_t *F_orig, sol_list_t *out,
         }
 
         polyset_init(&CS);
-        st = char_set_split(&CS, &P, &queue, ctx);
+        st = char_set_split(&CS, &P, &queue, field_reduce, ctx);
         if (st != SYS_OK)
         {
             polyset_clear(&CS, ctx);
