@@ -2,35 +2,50 @@
  * wu_charset.c
  *
  * 有限域 F_p 上多项式系统的吴特征列（Wu's characteristic set）方法求解
- * 基于 FLINT 库（nmod_mpoly：小素数模 p 的多元多项式）
+ * 基于 FLINT 库（nmod_mpoly / nmod_mpoly_factor）
  *
- * 算法框架：
- *   1. 变元排序 x0 < x1 < ... < x{n-1}（类 class = 最高出现变元的下标）
- *   2. 基列（basic set）选取：从多项式集合中取秩最小的约化升列
- *   3. 对余下多项式关于基列做逐次伪除（pseudo-remainder），
- *      非零余式加入集合，迭代直到全部余式为零 => 得到特征列 CS
- *   4. 零点分解定理：
- *         Zero(F) = Zero(CS / J)  ∪  ⋃_i Zero(F ∪ CS ∪ {I_i})
- *      其中 I_i 为特征列各元素的初式（initial），J = ∏ I_i。
- *      程序对每个分支递归计算特征列，并对三角列自下而上回代、
- *      用 nmod_poly 因式分解求单变元根，枚举出候选解，
- *      最后代回原系统 F 验证，去重后输出全部解。
+ * 相对朴素实现的优化：
+ *   1. 完整分解树（因式分解分裂）：
+ *      任何时刻出现的多项式 f（输入、伪除余式、初式）都先做不可约分解，
+ *      Zero(P ∪ {f1*f2}) = Zero(P ∪ {f1}) ∪ Zero(P ∪ {f2})，
+ *      系统按因子分裂为子系统入队。重数被丢弃（无平方化），
+ *      使各分支的多项式次数和项数保持很小。
+ *   2. 初式分支：Zero(F) = Zero(CS/J) ∪ ⋃ Zero(F ∪ CS ∪ {I_i})，
+ *      每个非常数初式产生一个子系统，保证不漏解。
+ *   3. 子系统去重 + DFS 工作队列 + 处理上限，防止分支爆炸。
+ *   4. 伪除快速路径：初式为常数时用标量逆元，避免整体乘法导致项数膨胀。
+ *   5. 可选 -f：利用 x^p = x（只求 F_p 有理点时成立）直接把所有指数
+ *      约化到 < p，超高次输入（如 x^100000）立即降为低次。
  *
- * 编译（需要 FLINT >= 3.0，2.8/2.9 亦兼容本文件用到的 API）：
+ * 用法:
+ *   ./wu_charset [k] [p] [-f]
+ *     k : 第一个方程为 x^k + y^k + z^k - 5（默认 1）
+ *     p : 素数模（默认 13）
+ *     -f: 开启 x^p = x 指数约化
+ *
+ * 编译（FLINT >= 3.0）:
  *   gcc -O2 -o wu_charset wu_charset.c -lflint -lgmp
- *   （某些发行版还需 -lmpfr）
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <flint/flint.h>
+#include <flint/nmod.h>
 #include <flint/nmod_mpoly.h>
+#include <flint/nmod_mpoly_factor.h>
 #include <flint/nmod_poly.h>
 #include <flint/nmod_poly_factor.h>
-#include <flint/nmod.h>
+
+#define MAX_SPLIT_FACTORS 8     /* 因子多于此数时不分裂，只取无平方部分 */
+#define MAX_SYSTEMS 20000       /* 处理的子系统总数上限 */
+#define FREE_VAR_ENUM_LIMIT 4096
+#define PRINT_COMPONENT_LIMIT 20
+
 /* ------------------------------------------------------------------ */
-/* 动态多项式集合                                                      */
+/* 多项式集合                                                          */
 /* ------------------------------------------------------------------ */
 
 typedef struct
@@ -57,7 +72,6 @@ static void polyset_clear(polyset_t *S, const nmod_mpoly_ctx_t ctx)
     S->len = S->alloc = 0;
 }
 
-/* 追加 f 的一份拷贝 */
 static void polyset_append(polyset_t *S, const nmod_mpoly_t f,
                            const nmod_mpoly_ctx_t ctx)
 {
@@ -72,7 +86,6 @@ static void polyset_append(polyset_t *S, const nmod_mpoly_t f,
     S->len++;
 }
 
-/* 集合中是否已有相同多项式（避免迭代时重复加入） */
 static int polyset_contains(const polyset_t *S, const nmod_mpoly_t f,
                             const nmod_mpoly_ctx_t ctx)
 {
@@ -83,11 +96,102 @@ static int polyset_contains(const polyset_t *S, const nmod_mpoly_t f,
     return 0;
 }
 
+static void polyset_copy(polyset_t *dst, const polyset_t *src,
+                         const nmod_mpoly_ctx_t ctx)
+{
+    slong i;
+    for (i = 0; i < src->len; i++)
+        polyset_append(dst, src->p + i, ctx);
+}
+
+/* 无序集合相等（用于子系统去重） */
+static int polyset_equal_unordered(const polyset_t *A, const polyset_t *B,
+                                   const nmod_mpoly_ctx_t ctx)
+{
+    slong i;
+    if (A->len != B->len)
+        return 0;
+    for (i = 0; i < A->len; i++)
+        if (!polyset_contains(B, A->p + i, ctx))
+            return 0;
+    return 1;
+}
+
+/* 删除第 i 个元素（保持顺序无关紧要，用尾部覆盖） */
+static void polyset_remove(polyset_t *S, slong i,
+                           const nmod_mpoly_ctx_t ctx)
+{
+    nmod_mpoly_swap(S->p + i, S->p + S->len - 1, ctx);
+    nmod_mpoly_clear(S->p + S->len - 1, ctx);
+    S->len--;
+}
+
 /* ------------------------------------------------------------------ */
-/* 基本工具：类、主变元次数、初式、伪除                                */
+/* 系统队列（DFS）与已处理列表                                          */
 /* ------------------------------------------------------------------ */
 
-/* 类 cls(f)：f 中出现的最高变元下标；常数多项式返回 -1 */
+typedef struct
+{
+    polyset_t *sys;
+    slong len;
+    slong alloc;
+} syslist_t;
+
+static void syslist_init(syslist_t *Q)
+{
+    Q->sys = NULL;
+    Q->len = 0;
+    Q->alloc = 0;
+}
+
+static void syslist_clear(syslist_t *Q, const nmod_mpoly_ctx_t ctx)
+{
+    slong i;
+    for (i = 0; i < Q->len; i++)
+        polyset_clear(Q->sys + i, ctx);
+    free(Q->sys);
+    Q->sys = NULL;
+    Q->len = Q->alloc = 0;
+}
+
+/* 压入 S 的拷贝 */
+static void syslist_push(syslist_t *Q, const polyset_t *S,
+                         const nmod_mpoly_ctx_t ctx)
+{
+    if (Q->len == Q->alloc)
+    {
+        Q->alloc = (Q->alloc == 0) ? 16 : 2 * Q->alloc;
+        Q->sys = (polyset_t *) realloc(Q->sys, Q->alloc * sizeof(polyset_t));
+    }
+    polyset_init(Q->sys + Q->len);
+    polyset_copy(Q->sys + Q->len, S, ctx);
+    Q->len++;
+}
+
+/* 弹出栈顶（所有权转移给 *out，调用方负责 clear） */
+static int syslist_pop(polyset_t *out, syslist_t *Q)
+{
+    if (Q->len == 0)
+        return 0;
+    *out = Q->sys[Q->len - 1];  /* 浅拷贝转移所有权 */
+    Q->len--;
+    return 1;
+}
+
+static int syslist_contains(const syslist_t *Q, const polyset_t *S,
+                            const nmod_mpoly_ctx_t ctx)
+{
+    slong i;
+    for (i = 0; i < Q->len; i++)
+        if (polyset_equal_unordered(Q->sys + i, S, ctx))
+            return 1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 基本工具：类、初式、伪除                                            */
+/* ------------------------------------------------------------------ */
+
 static slong poly_class(const nmod_mpoly_t f, const nmod_mpoly_ctx_t ctx)
 {
     slong n = nmod_mpoly_ctx_nvars(ctx);
@@ -98,7 +202,6 @@ static slong poly_class(const nmod_mpoly_t f, const nmod_mpoly_ctx_t ctx)
     return -1;
 }
 
-/* 秩比较：先比类，类相同比主变元次数。返回 <0, 0, >0 */
 static int rank_cmp(const nmod_mpoly_t f, const nmod_mpoly_t g,
                     const nmod_mpoly_ctx_t ctx)
 {
@@ -108,16 +211,13 @@ static int rank_cmp(const nmod_mpoly_t f, const nmod_mpoly_t g,
     if (cf != cg)
         return (cf < cg) ? -1 : 1;
     if (cf < 0)
-        return 0;               /* 两个常数秩相同 */
+        return 0;
     df = nmod_mpoly_degree_si(f, cf, ctx);
     dg = nmod_mpoly_degree_si(g, cf, ctx);
     return (df < dg) ? -1 : (df > dg) ? 1 : 0;
 }
 
-/*
- * 初式 init(f)：f 视为主变元 x_var 的一元多项式时的首项系数
- * （属于 F_p[x0,...,x_{var-1}]）
- */
+/* 初式：f 关于主变元 x_var 的首项系数 */
 static void poly_initial(nmod_mpoly_t lc, const nmod_mpoly_t f, slong var,
                          const nmod_mpoly_ctx_t ctx)
 {
@@ -127,8 +227,7 @@ static void poly_initial(nmod_mpoly_t lc, const nmod_mpoly_t f, slong var,
     nmod_mpoly_univar_init(u, ctx);
     nmod_mpoly_to_univar(u, f, var, ctx);
     len = nmod_mpoly_univar_length(u, ctx);
-
-    for (i = 0; i < len; i++)      /* 稳妥起见扫描最大指数项 */
+    for (i = 0; i < len; i++)
     {
         e = nmod_mpoly_univar_get_term_exp_si(u, i, ctx);
         if (e > best_e)
@@ -141,17 +240,13 @@ static void poly_initial(nmod_mpoly_t lc, const nmod_mpoly_t f, slong var,
         nmod_mpoly_univar_get_term_coeff(lc, u, best_i, ctx);
     else
         nmod_mpoly_zero(lc, ctx);
-
     nmod_mpoly_univar_clear(u, ctx);
 }
 
 /*
  * 伪除余式 r = prem(f, g, x_var)
- *
- * 逐步消去：当 deg_x(r) >= deg_x(g) 时
- *     r <- init(g) * r - init_x(r) * x^(dr-dg) * g
- * 每步 r 关于 x_var 的次数严格下降，保证终止。
- * （与经典 prem 相差 init(g) 的幂次因子，不影响零点集分析。）
+ * 优化：init(g) 为常数时，用其逆元缩放消去项，r 不做整体乘法，
+ *       避免稠密化；否则退回一般伪除。
  */
 static void poly_prem(nmod_mpoly_t r, const nmod_mpoly_t f,
                       const nmod_mpoly_t g, slong var,
@@ -159,11 +254,16 @@ static void poly_prem(nmod_mpoly_t r, const nmod_mpoly_t f,
 {
     nmod_mpoly_t lg, lr, t1, t2, xpow;
     slong dg, dr;
+    int lg_const;
+    ulong lg_inv = 1;
+    ulong p = nmod_mpoly_ctx_modulus(ctx);
+    nmod_t mod;
+
+    nmod_init(&mod, p);
 
     dg = nmod_mpoly_degree_si(g, var, ctx);
     if (dg <= 0)
     {
-        /* g 不含主变元时按约定不做伪除 */
         nmod_mpoly_set(r, f, ctx);
         return;
     }
@@ -175,6 +275,13 @@ static void poly_prem(nmod_mpoly_t r, const nmod_mpoly_t f,
     nmod_mpoly_init(xpow, ctx);
 
     poly_initial(lg, g, var, ctx);
+    lg_const = nmod_mpoly_is_ui(lg, ctx);
+    if (lg_const)
+    {
+        ulong c = nmod_mpoly_get_term_coeff_ui(lg, 0, ctx);
+        lg_inv = nmod_inv(c, mod);
+    }
+
     nmod_mpoly_set(r, f, ctx);
 
     while (!nmod_mpoly_is_zero(r, ctx) &&
@@ -192,10 +299,21 @@ static void poly_prem(nmod_mpoly_t r, const nmod_mpoly_t f,
             free(exps);
         }
 
-        nmod_mpoly_mul(t1, lg, r, ctx);      /* t1 = init(g) * r        */
-        nmod_mpoly_mul(t2, lr, g, ctx);      /* t2 = init(r) * g        */
-        nmod_mpoly_mul(t2, t2, xpow, ctx);   /* t2 *= x^(dr-dg)         */
-        nmod_mpoly_sub(r, t1, t2, ctx);      /* 首项相消，次数下降       */
+        if (lg_const)
+        {
+            /* r <- r - lg^{-1} * init(r) * x^(dr-dg) * g */
+            nmod_mpoly_scalar_mul_ui(t2, lr, lg_inv, ctx);
+            nmod_mpoly_mul(t2, t2, g, ctx);
+            nmod_mpoly_mul(t2, t2, xpow, ctx);
+            nmod_mpoly_sub(r, r, t2, ctx);
+        }
+        else
+        {
+            nmod_mpoly_mul(t1, lg, r, ctx);
+            nmod_mpoly_mul(t2, lr, g, ctx);
+            nmod_mpoly_mul(t2, t2, xpow, ctx);
+            nmod_mpoly_sub(r, t1, t2, ctx);
+        }
     }
 
     nmod_mpoly_clear(lg, ctx);
@@ -205,7 +323,6 @@ static void poly_prem(nmod_mpoly_t r, const nmod_mpoly_t f,
     nmod_mpoly_clear(xpow, ctx);
 }
 
-/* 对升列 B 逐次伪除：r = prem(...prem(prem(f, B_k), B_{k-1})..., B_1) */
 static void poly_prem_chain(nmod_mpoly_t r, const nmod_mpoly_t f,
                             const polyset_t *B, const nmod_mpoly_ctx_t ctx)
 {
@@ -213,7 +330,6 @@ static void poly_prem_chain(nmod_mpoly_t r, const nmod_mpoly_t f,
     nmod_mpoly_t tmp;
     nmod_mpoly_init(tmp, ctx);
     nmod_mpoly_set(r, f, ctx);
-
     for (i = B->len - 1; i >= 0; i--)
     {
         slong c = poly_class(B->p + i, ctx);
@@ -226,16 +342,163 @@ static void poly_prem_chain(nmod_mpoly_t r, const nmod_mpoly_t f,
 }
 
 /* ------------------------------------------------------------------ */
-/* 基列与特征列                                                        */
+/* x^p = x 指数约化（只求 F_p 有理点时保值）                            */
 /* ------------------------------------------------------------------ */
 
+static void field_reduce_exponents(nmod_mpoly_t g, const nmod_mpoly_t f,
+                                   const nmod_mpoly_ctx_t ctx)
+{
+    slong n = nmod_mpoly_ctx_nvars(ctx);
+    slong i, v, len = nmod_mpoly_length(f, ctx);
+    ulong p = nmod_mpoly_ctx_modulus(ctx);
+    ulong *exps = (ulong *) malloc(n * sizeof(ulong));
+    nmod_mpoly_t acc;
+
+    nmod_mpoly_init(acc, ctx);
+    nmod_mpoly_zero(acc, ctx);
+
+    for (i = 0; i < len; i++)
+    {
+        ulong c = nmod_mpoly_get_term_coeff_ui(f, i, ctx);
+        ulong c_old;
+        nmod_mpoly_get_term_exp_ui(exps, f, i, ctx);
+        for (v = 0; v < n; v++)
+            if (exps[v] >= p)   /* e >= 1 时 x^e = x^{((e-1) mod (p-1)) + 1} */
+                exps[v] = (exps[v] - 1) % (p - 1) + 1;
+        c_old = nmod_mpoly_get_coeff_ui_ui(acc, exps, ctx);
+        nmod_mpoly_set_coeff_ui_ui(acc, (c_old + c) % p, exps, ctx);
+    }
+    nmod_mpoly_swap(g, acc, ctx);
+    nmod_mpoly_clear(acc, ctx);
+    free(exps);
+}
+
+/* ------------------------------------------------------------------ */
+/* 因式分解分裂                                                        */
+/* ------------------------------------------------------------------ */
+
+static slong g_stat_systems = 0, g_stat_splits = 0, g_stat_charsets = 0;
+
 /*
- * 基列（basic set）：
- *   B1 = P 中秩最小的多项式；
- *   B_{i+1} = P 中类 > cls(B_i) 且关于 B_1..B_i 均约化
- *             （即对每个 B_j，其主变元次数低于 B_j）的秩最小者。
- * 得到一个约化升列。
+ * 取 f 的互异不可约因子（丢弃重数与常数因子），存入 bases。
+ * 分解失败时退化为 bases = {f}。
  */
+static void distinct_factors(polyset_t *bases, const nmod_mpoly_t f,
+                             const nmod_mpoly_ctx_t ctx)
+{
+    nmod_mpoly_factor_t fac;
+    slong i, nf;
+
+    nmod_mpoly_factor_init(fac, ctx);
+    if (nmod_mpoly_factor(fac, f, ctx))
+    {
+        nmod_mpoly_t b;
+        nmod_mpoly_init(b, ctx);
+        nf = nmod_mpoly_factor_length(fac, ctx);
+        for (i = 0; i < nf; i++)
+        {
+            nmod_mpoly_factor_get_base(b, fac, i, ctx);
+            if (!nmod_mpoly_is_ui(b, ctx) && !polyset_contains(bases, b, ctx))
+                polyset_append(bases, b, ctx);
+        }
+        nmod_mpoly_clear(b, ctx);
+    }
+    else
+    {
+        polyset_append(bases, f, ctx);
+    }
+    nmod_mpoly_factor_clear(fac, ctx);
+}
+
+enum { SYS_OK = 0, SYS_CONTRA = 1, SYS_SPLIT = 2 };
+
+/*
+ * 系统规范化：
+ *   - 删除零多项式；非零常数 => 矛盾
+ *   - 可选 x^p=x 指数约化
+ *   - 每个多项式做不可约分解：
+ *       单因子   => 用无平方因子替换原式
+ *       多因子   => 系统按因子分裂为子系统入队（完整分解树的核心步骤）
+ *       因子过多 => 用互异因子之积（无平方部分）替换，不分裂
+ */
+static int normalize_system(polyset_t *P, syslist_t *Q, int field_reduce,
+                            const nmod_mpoly_ctx_t ctx)
+{
+    slong i, j;
+
+    for (i = 0; i < P->len; )
+    {
+        polyset_t bases;
+
+        if (nmod_mpoly_is_zero(P->p + i, ctx))
+        {
+            polyset_remove(P, i, ctx);
+            continue;
+        }
+        if (nmod_mpoly_is_ui(P->p + i, ctx))
+            return SYS_CONTRA;
+
+        if (field_reduce)
+        {
+            field_reduce_exponents(P->p + i, P->p + i, ctx);
+            if (nmod_mpoly_is_zero(P->p + i, ctx))
+            {
+                polyset_remove(P, i, ctx);
+                continue;
+            }
+            if (nmod_mpoly_is_ui(P->p + i, ctx))
+                return SYS_CONTRA;
+        }
+
+        polyset_init(&bases);
+        distinct_factors(&bases, P->p + i, ctx);
+
+        if (bases.len == 0)     /* 只剩常数因子：非零常数 => 矛盾 */
+        {
+            polyset_clear(&bases, ctx);
+            return SYS_CONTRA;
+        }
+        else if (bases.len == 1)
+        {
+            nmod_mpoly_set(P->p + i, bases.p, ctx);
+            i++;
+        }
+        else if (bases.len <= MAX_SPLIT_FACTORS)
+        {
+            /* 分裂：Zero(P ∪ {∏ b_j}) = ⋃_j Zero(P ∪ {b_j}) */
+            for (j = 0; j < bases.len; j++)
+            {
+                nmod_mpoly_set(P->p + i, bases.p + j, ctx);
+                syslist_push(Q, P, ctx);
+            }
+            g_stat_splits++;
+            polyset_clear(&bases, ctx);
+            return SYS_SPLIT;
+        }
+        else
+        {
+            /* 因子过多：只取无平方部分，避免分支爆炸 */
+            nmod_mpoly_set(P->p + i, bases.p, ctx);
+            for (j = 1; j < bases.len; j++)
+                nmod_mpoly_mul(P->p + i, P->p + i, bases.p + j, ctx);
+            i++;
+        }
+        polyset_clear(&bases, ctx);
+    }
+
+    /* 集合内去重 */
+    for (i = 0; i < P->len; i++)
+        for (j = P->len - 1; j > i; j--)
+            if (nmod_mpoly_equal(P->p + i, P->p + j, ctx))
+                polyset_remove(P, j, ctx);
+
+    return SYS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* 基列与特征列（余式即时分解，必要时分裂系统）                          */
+/* ------------------------------------------------------------------ */
+
 static void basic_set(polyset_t *B, const polyset_t *P,
                       const nmod_mpoly_ctx_t ctx)
 {
@@ -255,9 +518,8 @@ static void basic_set(polyset_t *B, const polyset_t *P,
             if (nmod_mpoly_is_zero(f, ctx))
                 continue;
             if (B->len > 0 && cf <= last_class)
-                continue;       /* 升列要求类严格递增 */
+                continue;
 
-            /* 关于已选元素约化：对每个 B_j，deg_{x_{cls(B_j)}}(f) < deg(B_j) */
             for (j = 0; j < B->len; j++)
             {
                 slong cj = poly_class(B->p + j, ctx);
@@ -281,33 +543,32 @@ static void basic_set(polyset_t *B, const polyset_t *P,
 
         polyset_append(B, P->p + best, ctx);
         last_class = poly_class(P->p + best, ctx);
-        if (last_class < 0)     /* 选到非零常数：矛盾列，直接结束 */
+        if (last_class < 0)
             break;
     }
 }
 
 /*
- * 吴特征列主循环：
- *   P <- F
- *   repeat:
- *     B <- basic_set(P)
- *     R <- { prem(f, B) != 0 : f ∈ P \ B }
- *     若 R 为空则 CS = B；否则 P <- P ∪ R
- * 返回 0 正常；返回 1 表示特征列含非零常数（该分支无解）。
+ * 特征列计算（带分裂）：
+ *   工作集 P 上迭代取基列 B，对余集做伪除；
+ *   每个非零余式 r 先做不可约分解：
+ *     常数        => 矛盾（r ∈ ideal(P)）
+ *     单因子      => 加入工作集
+ *     多因子      => 系统分裂入队，本分支终止（SYS_SPLIT）
+ * 正常收敛时 CS = B。
  */
-static int char_set(polyset_t *CS, const polyset_t *F,
-                    const nmod_mpoly_ctx_t ctx)
+static int char_set_split(polyset_t *CS, const polyset_t *F, syslist_t *Q,
+                          const nmod_mpoly_ctx_t ctx)
 {
     polyset_t P;
     nmod_mpoly_t r;
-    slong i, round = 0;
+    slong i, j, round = 0;
+    int ret = SYS_OK;
 
     polyset_init(&P);
     nmod_mpoly_init(r, ctx);
-
     for (i = 0; i < F->len; i++)
-        if (!nmod_mpoly_is_zero(F->p + i, ctx) &&
-            !polyset_contains(&P, F->p + i, ctx))
+        if (!polyset_contains(&P, F->p + i, ctx))
             polyset_append(&P, F->p + i, ctx);
 
     while (1)
@@ -319,18 +580,16 @@ static int char_set(polyset_t *CS, const polyset_t *F,
         CS->len = 0;
 
         basic_set(CS, &P, ctx);
+        g_stat_charsets++;
 
-        /* 基列含非零常数 => 1 ∈ 理想，系统矛盾 */
         if (CS->len > 0 && poly_class(CS->p, ctx) < 0)
         {
-            polyset_clear(&P, ctx);
-            nmod_mpoly_clear(r, ctx);
-            return 1;
+            ret = SYS_CONTRA;
+            goto done;
         }
 
         for (i = 0; i < P.len; i++)
         {
-            slong j;
             int in_B = 0;
             for (j = 0; j < CS->len; j++)
                 if (nmod_mpoly_equal(P.p + i, CS->p + j, ctx))
@@ -342,41 +601,99 @@ static int char_set(polyset_t *CS, const polyset_t *F,
                 continue;
 
             poly_prem_chain(r, P.p + i, CS, ctx);
-            if (!nmod_mpoly_is_zero(r, ctx) && !polyset_contains(&P, r, ctx))
+            if (nmod_mpoly_is_zero(r, ctx))
+                continue;
+            if (nmod_mpoly_is_ui(r, ctx))   /* 非零常数 ∈ ideal(P)：矛盾 */
             {
-                if (poly_class(r, ctx) < 0)   /* 余式为非零常数：矛盾 */
+                ret = SYS_CONTRA;
+                goto done;
+            }
+
+            {
+                polyset_t bases;
+                int any_in = 0;
+                polyset_init(&bases);
+                distinct_factors(&bases, r, ctx);
+                for (j = 0; j < bases.len; j++)
+                    if (polyset_contains(&P, bases.p + j, ctx))
+                        any_in = 1;
+
+                if (bases.len == 0)
                 {
-                    polyset_clear(&P, ctx);
-                    nmod_mpoly_clear(r, ctx);
-                    return 1;
+                    polyset_clear(&bases, ctx);
+                    ret = SYS_CONTRA;
+                    goto done;
                 }
-                polyset_append(&P, r, ctx);
-                has_new = 1;
+                else if (any_in)
+                {
+                    /* r ∈ ideal(P) 且其某因子已在 P 中：
+                       零点集无新信息。跳过，不分裂（否则子系统与
+                       当前系统相同，会被去重丢弃导致漏解）。
+                       此时链可能提前收敛为“弱特征列”，但 CS ⊆ P
+                       保证 Zero(P) ⊆ Zero(CS)，枚举+验证仍然完备。 */
+                }
+                else if (bases.len == 1)
+                {
+                    polyset_append(&P, bases.p, ctx);
+                    has_new = 1;
+                }
+                else if (bases.len <= MAX_SPLIT_FACTORS)
+                {
+                    /* Zero(P) = Zero(P ∪ {r}) = ⋃_j Zero(P ∪ {b_j})，分裂 */
+                    for (j = 0; j < bases.len; j++)
+                    {
+                        polyset_t child;
+                        polyset_init(&child);
+                        polyset_copy(&child, &P, ctx);
+                        polyset_append(&child, bases.p + j, ctx);
+                        syslist_push(Q, &child, ctx);
+                        polyset_clear(&child, ctx);
+                    }
+                    g_stat_splits++;
+                    polyset_clear(&bases, ctx);
+                    ret = SYS_SPLIT;
+                    goto done;
+                }
+                else
+                {
+                    nmod_mpoly_t sf;
+                    nmod_mpoly_init(sf, ctx);
+                    nmod_mpoly_set(sf, bases.p, ctx);
+                    for (j = 1; j < bases.len; j++)
+                        nmod_mpoly_mul(sf, sf, bases.p + j, ctx);
+                    if (!polyset_contains(&P, sf, ctx))
+                    {
+                        polyset_append(&P, sf, ctx);
+                        has_new = 1;
+                    }
+                    nmod_mpoly_clear(sf, ctx);
+                }
+                polyset_clear(&bases, ctx);
             }
         }
 
         if (!has_new)
             break;
-
-        if (++round > 200)      /* 保险阈值，理论上必终止 */
+        if (++round > 500)
         {
             fprintf(stderr, "warning: charset iteration limit reached\n");
             break;
         }
     }
 
+done:
     polyset_clear(&P, ctx);
     nmod_mpoly_clear(r, ctx);
-    return 0;
+    return ret;
 }
 
 /* ------------------------------------------------------------------ */
-/* 三角列回代求解（枚举 F_p 中的零点）                                  */
+/* 解列表与三角列回代                                                  */
 /* ------------------------------------------------------------------ */
 
 typedef struct
 {
-    ulong *vals;                /* 扁平存放：每 nvars 个为一组解 */
+    ulong *vals;
     slong count;
     slong alloc;
     slong nvars;
@@ -414,7 +731,6 @@ static void sol_list_add_unique(sol_list_t *L, const ulong *sol)
     L->count++;
 }
 
-/* 解是否满足整个系统 F */
 static int check_solution(const polyset_t *F, const ulong *sol,
                           const nmod_mpoly_ctx_t ctx)
 {
@@ -425,7 +741,6 @@ static int check_solution(const polyset_t *F, const ulong *sol,
     return 1;
 }
 
-/* 把仅含变元 var 的 mpoly 转成一元 nmod_poly */
 static void mpoly_to_nmod_poly(nmod_poly_t up, const nmod_mpoly_t f,
                                slong var, const nmod_mpoly_ctx_t ctx)
 {
@@ -443,7 +758,7 @@ static void mpoly_to_nmod_poly(nmod_poly_t up, const nmod_mpoly_t f,
     free(exps);
 }
 
-/* 求一元多项式在 F_p 中的全部根（通过因式分解取一次因子） */
+/* 一元多项式在 F_p 中的全部根（因式分解取一次因子） */
 static slong wu_poly_roots(ulong *roots, const nmod_poly_t f)
 {
     nmod_poly_factor_t fac;
@@ -454,31 +769,20 @@ static slong wu_poly_roots(ulong *roots, const nmod_poly_t f)
 
     nmod_poly_factor_init(fac);
     nmod_poly_factor(fac, f);
-
     for (i = 0; i < fac->num; i++)
     {
         const nmod_poly_struct *g = fac->p + i;
         if (nmod_poly_degree(g) == 1)
         {
-            /* g = a*x + b，根 = -b * a^{-1} mod p */
             ulong b = nmod_poly_get_coeff_ui(g, 0);
             ulong a = nmod_poly_get_coeff_ui(g, 1);
-            ulong r = nmod_mul(nmod_neg(b, f->mod),
-                               nmod_inv(a, f->mod), f->mod);
-            roots[nroots++] = r;
+            roots[nroots++] = nmod_mul(nmod_neg(b, f->mod),
+                                       nmod_inv(a, f->mod), f->mod);
         }
     }
     nmod_poly_factor_clear(fac);
     return nroots;
 }
-
-/*
- * 沿三角列自下而上回代枚举解。
- *   var  : 当前处理的变元下标（从 0 递增）
- *   sol  : 已确定的部分解
- * 若某变元不是任何列元素的类（欠定 / 初式退化），当 p 较小时穷举该变元。
- */
-#define FREE_VAR_ENUM_LIMIT 4096
 
 static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
                             sol_list_t *out, ulong *sol, slong var,
@@ -492,12 +796,11 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
 
     if (var == n)
     {
-        if (check_solution(F, sol, ctx))   /* 代回原系统验证 */
+        if (check_solution(F, sol, ctx))
             sol_list_add_unique(out, sol);
         return;
     }
 
-    /* 找类恰为 var 的列元素 */
     for (i = 0; i < CS->len; i++)
         if (poly_class(CS->p + i, ctx) == var)
         {
@@ -509,7 +812,6 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
 
     if (pivot != NULL)
     {
-        /* 代入 x0..x{var-1} 的已知值，得到 x_var 的一元多项式 */
         slong j;
         nmod_mpoly_t tmp;
         nmod_mpoly_init(tmp, ctx);
@@ -523,13 +825,12 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
 
         if (nmod_mpoly_is_zero(sub, ctx))
         {
-            pivot = NULL;       /* 初式退化，多项式恒为零：转为自由变元 */
+            pivot = NULL;       /* 初式退化：转自由变元 */
         }
         else if (poly_class(sub, ctx) < 0)
         {
-            /* 变成非零常数：该分支无解 */
             nmod_mpoly_clear(sub, ctx);
-            return;
+            return;             /* 非零常数：无解分支 */
         }
         else
         {
@@ -542,7 +843,6 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
             deg = nmod_poly_degree(up);
             roots = (ulong *) malloc((deg > 0 ? deg : 1) * sizeof(ulong));
             nroots = wu_poly_roots(roots, up);
-
             for (k = 0; k < nroots; k++)
             {
                 sol[var] = roots[k];
@@ -555,7 +855,6 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
 
     if (pivot == NULL)
     {
-        /* 自由变元：小域时穷举 */
         if (p <= FREE_VAR_ENUM_LIMIT)
         {
             ulong v;
@@ -568,8 +867,8 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
         else
         {
             fprintf(stderr,
-                    "warning: x%ld 为自由变元且 p=%lu 过大，跳过穷举 "
-                    "(解集可能为正维数)\n", (long) var, (unsigned long) p);
+                    "warning: x%ld 为自由变元且 p=%lu 过大，跳过穷举\n",
+                    (long) var, (unsigned long) p);
         }
     }
 
@@ -577,10 +876,8 @@ static void enumerate_zeros(const polyset_t *CS, const polyset_t *F,
 }
 
 /* ------------------------------------------------------------------ */
-/* 吴零点分解：Zero(F) = Zero(CS/J) ∪ ⋃ Zero(F ∪ CS ∪ {I_i})           */
+/* 队列驱动的完整吴分解求解器                                          */
 /* ------------------------------------------------------------------ */
-
-#define MAX_DECOMP_DEPTH 12
 
 static void print_polyset(const char *title, const polyset_t *S,
                           const char **vars, const nmod_mpoly_ctx_t ctx)
@@ -595,137 +892,241 @@ static void print_polyset(const char *title, const polyset_t *S,
     }
 }
 
-static void wu_solve_rec(const polyset_t *F_orig, const polyset_t *F_cur,
-                         sol_list_t *out, slong depth, const char **vars,
-                         const nmod_mpoly_ctx_t ctx)
+static void wu_solve(const polyset_t *F_orig, sol_list_t *out,
+                     int field_reduce, const char **vars,
+                     const nmod_mpoly_ctx_t ctx)
 {
-    polyset_t CS;
+    syslist_t queue, processed;
+    polyset_t P;
     slong n = nmod_mpoly_ctx_nvars(ctx);
-    slong i;
-    ulong *sol;
+    slong ncomp = 0;
 
-    if (depth > MAX_DECOMP_DEPTH)
-        return;
+    syslist_init(&queue);
+    syslist_init(&processed);
+    syslist_push(&queue, F_orig, ctx);
 
-    polyset_init(&CS);
-    if (char_set(&CS, F_cur, ctx) != 0)
+    while (syslist_pop(&P, &queue))
     {
-        if (depth == 0)
-            printf("特征列含非零常数：系统在 F_p 上无解。\n");
-        polyset_clear(&CS, ctx);
-        return;
-    }
+        polyset_t CS;
+        int st;
+        slong i;
 
-    if (depth == 0)
-        print_polyset("特征列 CS:", &CS, vars, ctx);
-
-    /* 主分支：枚举 Zero(CS)，逐一代回原系统 F 验证（自动涵盖 Zero(CS/J)） */
-    sol = (ulong *) calloc(n, sizeof(ulong));
-    enumerate_zeros(&CS, F_orig, out, sol, 0, ctx);
-    free(sol);
-
-    /* 分支：对每个非平凡初式 I_i，递归求解 F ∪ CS ∪ {I_i}，
-       补回主分支中因初式为零而漏掉的解 */
-    for (i = 0; i < CS.len; i++)
-    {
-        slong c = poly_class(CS.p + i, ctx);
-        nmod_mpoly_t I;
-
-        if (c < 0)
-            continue;
-        nmod_mpoly_init(I, ctx);
-        poly_initial(I, CS.p + i, c, ctx);
-
-        if (!nmod_mpoly_is_ui(I, ctx))   /* 初式非常数才需要分支 */
+        if (g_stat_systems >= MAX_SYSTEMS)
         {
-            polyset_t Fb;
-            slong j;
-            polyset_init(&Fb);
-            for (j = 0; j < F_cur->len; j++)
-                polyset_append(&Fb, F_cur->p + j, ctx);
-            for (j = 0; j < CS.len; j++)
-                if (!polyset_contains(&Fb, CS.p + j, ctx))
-                    polyset_append(&Fb, CS.p + j, ctx);
-            if (!polyset_contains(&Fb, I, ctx))
-            {
-                polyset_append(&Fb, I, ctx);
-                wu_solve_rec(F_orig, &Fb, out, depth + 1, vars, ctx);
-            }
-            polyset_clear(&Fb, ctx);
+            fprintf(stderr, "warning: 子系统数达到上限 %d，提前停止\n",
+                    MAX_SYSTEMS);
+            polyset_clear(&P, ctx);
+            break;
         }
-        nmod_mpoly_clear(I, ctx);
+
+        if (syslist_contains(&processed, &P, ctx))   /* 去重 */
+        {
+            polyset_clear(&P, ctx);
+            continue;
+        }
+        syslist_push(&processed, &P, ctx);
+        g_stat_systems++;
+
+        st = normalize_system(&P, &queue, field_reduce, ctx);
+        if (st != SYS_OK)
+        {
+            polyset_clear(&P, ctx);
+            continue;
+        }
+        if (P.len == 0)          /* 空系统：全空间，稀有情形 */
+        {
+            polyset_clear(&P, ctx);
+            continue;
+        }
+
+        polyset_init(&CS);
+        st = char_set_split(&CS, &P, &queue, ctx);
+        if (st != SYS_OK)
+        {
+            polyset_clear(&CS, ctx);
+            polyset_clear(&P, ctx);
+            continue;
+        }
+
+        ncomp++;
+        if (ncomp <= PRINT_COMPONENT_LIMIT)
+        {
+            char title[64];
+            snprintf(title, sizeof(title), "分支 #%ld 的特征列:",
+                     (long) ncomp);
+            print_polyset(title, &CS, vars, ctx);
+        }
+
+        /* 主分支：枚举 Zero(CS)，代回原系统验证 */
+        {
+            ulong *sol = (ulong *) calloc(n, sizeof(ulong));
+            enumerate_zeros(&CS, F_orig, out, sol, 0, ctx);
+            free(sol);
+        }
+
+        /* 初式分支：Zero(F) ⊇ Zero(F ∪ CS ∪ {I_i}) 补漏 */
+        for (i = 0; i < CS.len; i++)
+        {
+            slong c = poly_class(CS.p + i, ctx);
+            nmod_mpoly_t I;
+
+            if (c < 0)
+                continue;
+            nmod_mpoly_init(I, ctx);
+            poly_initial(I, CS.p + i, c, ctx);
+            if (!nmod_mpoly_is_ui(I, ctx))
+            {
+                polyset_t child;
+                slong j;
+                polyset_init(&child);
+                polyset_copy(&child, &P, ctx);
+                for (j = 0; j < CS.len; j++)
+                    if (!polyset_contains(&child, CS.p + j, ctx))
+                        polyset_append(&child, CS.p + j, ctx);
+                polyset_append(&child, I, ctx);
+                if (!syslist_contains(&processed, &child, ctx))
+                    syslist_push(&queue, &child, ctx);
+                polyset_clear(&child, ctx);
+            }
+            nmod_mpoly_clear(I, ctx);
+        }
+
+        polyset_clear(&CS, ctx);
+        polyset_clear(&P, ctx);
     }
 
-    polyset_clear(&CS, ctx);
+    syslist_clear(&queue, ctx);
+    syslist_clear(&processed, ctx);
 }
 
 /* ------------------------------------------------------------------ */
-/* 主程序：示例                                                        */
+/* 主程序                                                              */
 /* ------------------------------------------------------------------ */
 
-int main(void)
+static int is_prime_ui(ulong n)
 {
-    /* 变元顺序即消元顺序：x < y < z */
+    ulong d;
+    if (n < 2)
+        return 0;
+    if (n % 2 == 0)
+        return n == 2;
+    for (d = 3; d * d <= n; d += 2)
+        if (n % d == 0)
+            return 0;
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
     const char *vars[] = { "x", "y", "z" };
     slong nvars = 3;
-    ulong p = 13;               /* 素数域 F_13，可改 */
+    ulong p = 13;
+    ulong k = 1;
+    int field_reduce = 0;
+    int npos = 0;
+    int i;
 
-    /* 待解系统 F ⊂ F_p[x,y,z]，字符串按需修改即可 */
-    /* e1=5, e2=8, e3=4  =>  x,y,z 是 t^3-5t^2+8t-4=(t-1)(t-2)^2 的根，
-       解应为 (1,2,2) 的全部排列，共 3 组 */
-    const char *system_strs[] = {
-        "x^10 + y^10 + z^10 - 5",
-        "x*y + y*z + z*x - 8",
-        "x*y*z - 4",
-    };
-    slong nf = sizeof(system_strs) / sizeof(system_strs[0]);
-
-    nmod_mpoly_ctx_t ctx;
-    polyset_t F;
-    sol_list_t sols;
-    slong i;
-
-    nmod_mpoly_ctx_init(ctx, nvars, ORD_LEX, p);
-    polyset_init(&F);
-    sol_list_init(&sols, nvars);
-
-    printf("======  吴特征列方法 / F_%lu  ======\n", (unsigned long) p);
-    printf("变元序: ");
-    for (i = 0; i < nvars; i++)
-        printf("%s%s", vars[i], i + 1 < nvars ? " < " : "\n");
-
-    for (i = 0; i < nf; i++)
+    for (i = 1; i < argc; i++)
     {
-        nmod_mpoly_t f;
-        nmod_mpoly_init(f, ctx);
-        if (nmod_mpoly_set_str_pretty(f, system_strs[i], vars, ctx) != 0)
+        if (strcmp(argv[i], "-f") == 0)
+            field_reduce = 1;
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
         {
-            fprintf(stderr, "解析失败: %s\n", system_strs[i]);
-            nmod_mpoly_clear(f, ctx);
-            continue;
+            printf("用法: %s [k] [p] [-f]\n"
+                   "  k : x^k + y^k + z^k - 5 中的指数 (默认 1)\n"
+                   "  p : 素数模 (默认 13)\n"
+                   "  -f: 开启 x^p = x 指数约化 (只求 F_p 有理点时保值)\n",
+                   argv[0]);
+            return 0;
+        }
+        else
+        {
+            ulong v = strtoul(argv[i], NULL, 10);
+            if (npos == 0)
+                k = v;
+            else if (npos == 1)
+                p = v;
+            npos++;
+        }
+    }
+
+    if (k == 0)
+        k = 1;
+    if (!is_prime_ui(p))
+    {
+        fprintf(stderr, "错误: p = %lu 不是素数\n", (unsigned long) p);
+        return 1;
+    }
+
+    {
+        nmod_mpoly_ctx_t ctx;
+        polyset_t F;
+        sol_list_t sols;
+        nmod_mpoly_t f;
+        slong j;
+        clock_t t0, t1;
+
+        nmod_mpoly_ctx_init(ctx, nvars, ORD_LEX, p);
+        polyset_init(&F);
+        sol_list_init(&sols, nvars);
+
+        printf("======  吴特征列方法（完整分解树） / F_%lu, k=%lu%s ======\n",
+               (unsigned long) p, (unsigned long) k,
+               field_reduce ? ", 指数约化开" : "");
+        printf("变元序: x < y < z\n");
+
+        /* f1 = x^k + y^k + z^k - 5 （程序化构造，k 可以很大） */
+        nmod_mpoly_init(f, ctx);
+        {
+            ulong *exps = (ulong *) calloc(nvars, sizeof(ulong));
+            nmod_mpoly_zero(f, ctx);
+            for (j = 0; j < nvars; j++)
+            {
+                memset(exps, 0, nvars * sizeof(ulong));
+                exps[j] = k;
+                nmod_mpoly_set_coeff_ui_ui(f, 1, exps, ctx);
+            }
+            memset(exps, 0, nvars * sizeof(ulong));
+            nmod_mpoly_set_coeff_ui_ui(f, (p - 5 % p) % p, exps, ctx);
+            free(exps);
         }
         polyset_append(&F, f, ctx);
+
+        /* f2, f3 */
+        nmod_mpoly_set_str_pretty(f, "x*y + y*z + z*x - 8", vars, ctx);
+        polyset_append(&F, f, ctx);
+        nmod_mpoly_set_str_pretty(f, "x*y*z - 4", vars, ctx);
+        polyset_append(&F, f, ctx);
         nmod_mpoly_clear(f, ctx);
+
+        print_polyset("输入系统 F:", &F, vars, ctx);
+
+        t0 = clock();
+        wu_solve(&F, &sols, field_reduce, vars, ctx);
+        t1 = clock();
+
+        printf("\nF_%lu 上的解 (共 %ld 组):\n",
+               (unsigned long) p, (long) sols.count);
+        for (j = 0; j < sols.count; j++)
+        {
+            slong v;
+            printf("  (");
+            for (v = 0; v < nvars; v++)
+                printf("%s=%lu%s", vars[v],
+                       (unsigned long) sols.vals[j * nvars + v],
+                       v + 1 < nvars ? ", " : "");
+            printf(")\n");
+        }
+
+        printf("\n统计: 处理子系统 %ld 个, 分裂 %ld 次, 特征列迭代 %ld 轮, "
+               "耗时 %.3f s\n",
+               (long) g_stat_systems, (long) g_stat_splits,
+               (long) g_stat_charsets,
+               (double) (t1 - t0) / CLOCKS_PER_SEC);
+
+        sol_list_clear(&sols);
+        polyset_clear(&F, ctx);
+        nmod_mpoly_ctx_clear(ctx);
     }
-    print_polyset("输入系统 F:", &F, vars, ctx);
-
-    wu_solve_rec(&F, &F, &sols, 0, vars, ctx);
-
-    printf("\nF_%lu 上的解 (共 %ld 组):\n",
-           (unsigned long) p, (long) sols.count);
-    for (i = 0; i < sols.count; i++)
-    {
-        slong v;
-        printf("  (");
-        for (v = 0; v < nvars; v++)
-            printf("%s=%lu%s", vars[v],
-                   (unsigned long) sols.vals[i * nvars + v],
-                   v + 1 < nvars ? ", " : "");
-        printf(")\n");
-    }
-
-    sol_list_clear(&sols);
-    polyset_clear(&F, ctx);
-    nmod_mpoly_ctx_clear(ctx);
     return 0;
 }
