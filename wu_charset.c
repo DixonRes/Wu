@@ -20,9 +20,6 @@
  *   gcc -O2 -o wu_charset wu_charset.c -lflint -lgmp
  *   （某些发行版还需 -lmpfr）
  */
-#define nmod_mul(a, b, mod) n_mulmod2_preinv(a, b, (mod).n, (mod).ninv)
-#define nmod_neg(a, mod) n_negmod(a, (mod).n)
-#define nmod_inv(a, mod) n_invmod(a, (mod).n)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +28,7 @@
 #include <flint/nmod_mpoly.h>
 #include <flint/nmod_poly.h>
 #include <flint/nmod_poly_factor.h>
-
+#include <flint/nmod.h>
 /* ------------------------------------------------------------------ */
 /* 动态多项式集合                                                      */
 /* ------------------------------------------------------------------ */
