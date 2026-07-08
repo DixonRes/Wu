@@ -23,7 +23,7 @@
  *
  * 用法:
  *   ./wu_charset [k] [p] [-f]
- *     k : 第一个方程为 x^k + y^k + z^k - 5（默认 1）
+ *     k : 第一个方程为 x^k + y^k + z^k + w^k - 5（默认 1）
  *     p : 素数模（默认 13）
  *     -f: 开启 x^p = x 指数约化
  *
@@ -170,6 +170,20 @@ static void syslist_push(syslist_t *Q, const polyset_t *S,
     polyset_init(Q->sys + Q->len);
     polyset_copy(Q->sys + Q->len, S, ctx);
     Q->len++;
+}
+
+static int syslist_contains(const syslist_t *Q, const polyset_t *S,
+                            const nmod_mpoly_ctx_t ctx);
+
+/* 压入 S 的拷贝，但若队列中已有等价（无序相等）系统则跳过。
+   用于分裂/初式分支，消除大量重复子系统（否则会反复重跑
+   因式分解与伪除，是主要性能瓶颈来源）。 */
+static void syslist_push_unique(syslist_t *Q, const polyset_t *S,
+                                const nmod_mpoly_ctx_t ctx)
+{
+    if (syslist_contains(Q, S, ctx))
+        return;
+    syslist_push(Q, S, ctx);
 }
 
 /* 弹出栈顶（所有权转移给 *out，调用方负责 clear） */
@@ -435,11 +449,87 @@ static slong g_stat_systems = 0, g_stat_splits = 0, g_stat_charsets = 0;
  * 取 f 的互异不可约因子（丢弃重数与常数因子），存入 bases。
  * 分解失败时退化为 bases = {f}。
  */
+/* ---- 因式分解缓存（LRU 环形，按精确相等命中） ------------------- */
+#define FACTOR_CACHE_SIZE 256
+typedef struct
+{
+    nmod_mpoly_struct key;   /* 输入多项式 */
+    polyset_t val;           /* 互异不可约因子 */
+    int used;
+} factor_cache_entry;
+
+static factor_cache_entry g_fcache[FACTOR_CACHE_SIZE];
+static int g_fcache_next = 0;
+static int g_fcache_init = 0;
+static const nmod_mpoly_ctx_struct *g_fcache_ctx = NULL;
+static slong g_fcache_hits = 0, g_fcache_miss = 0;
+
+/* 命中返回 1 并把结果拷入 bases；未命中返回 0。 */
+static int factor_cache_lookup(polyset_t *bases, const nmod_mpoly_t f,
+                               const nmod_mpoly_ctx_t ctx)
+{
+    int i;
+    if (!g_fcache_init || g_fcache_ctx != ctx)
+        return 0;
+    for (i = 0; i < FACTOR_CACHE_SIZE; i++)
+        if (g_fcache[i].used &&
+            nmod_mpoly_equal(&g_fcache[i].key, f, ctx))
+        {
+            polyset_copy(bases, &g_fcache[i].val, ctx);
+            g_fcache_hits++;
+            return 1;
+        }
+    return 0;
+}
+
+static void factor_cache_store(const nmod_mpoly_t f, const polyset_t *bases,
+                               const nmod_mpoly_ctx_t ctx)
+{
+    factor_cache_entry *e;
+    if (!g_fcache_init || g_fcache_ctx != ctx)
+    {
+        /* 上下文变化（例如新一次运行）：重置缓存 */
+        if (g_fcache_init && g_fcache_ctx != NULL)
+        {
+            int i;
+            for (i = 0; i < FACTOR_CACHE_SIZE; i++)
+                if (g_fcache[i].used)
+                {
+                    nmod_mpoly_clear(&g_fcache[i].key,
+                                     (nmod_mpoly_ctx_struct *) g_fcache_ctx);
+                    polyset_clear(&g_fcache[i].val,
+                                  (nmod_mpoly_ctx_struct *) g_fcache_ctx);
+                    g_fcache[i].used = 0;
+                }
+        }
+        memset(g_fcache, 0, sizeof(g_fcache));
+        g_fcache_next = 0;
+        g_fcache_ctx = ctx;
+        g_fcache_init = 1;
+    }
+    e = &g_fcache[g_fcache_next];
+    if (e->used)
+    {
+        nmod_mpoly_clear(&e->key, ctx);
+        polyset_clear(&e->val, ctx);
+    }
+    nmod_mpoly_init(&e->key, ctx);
+    nmod_mpoly_set(&e->key, f, ctx);
+    polyset_init(&e->val);
+    polyset_copy(&e->val, bases, ctx);
+    e->used = 1;
+    g_fcache_next = (g_fcache_next + 1) % FACTOR_CACHE_SIZE;
+}
+
 static void distinct_factors(polyset_t *bases, const nmod_mpoly_t f,
                              const nmod_mpoly_ctx_t ctx)
 {
     nmod_mpoly_factor_t fac;
     slong i, nf;
+
+    if (factor_cache_lookup(bases, f, ctx))
+        return;
+    g_fcache_miss++;
 
     nmod_mpoly_factor_init(fac, ctx);
     if (nmod_mpoly_factor(fac, f, ctx))
@@ -460,6 +550,8 @@ static void distinct_factors(polyset_t *bases, const nmod_mpoly_t f,
         polyset_append(bases, f, ctx);
     }
     nmod_mpoly_factor_clear(fac, ctx);
+
+    factor_cache_store(f, bases, ctx);
 }
 
 enum { SYS_OK = 0, SYS_CONTRA = 1, SYS_SPLIT = 2 };
@@ -521,7 +613,7 @@ static int normalize_system(polyset_t *P, syslist_t *Q, int field_reduce,
             for (j = 0; j < bases.len; j++)
             {
                 nmod_mpoly_set(P->p + i, bases.p + j, ctx);
-                syslist_push(Q, P, ctx);
+                syslist_push_unique(Q, P, ctx);
             }
             g_stat_splits++;
             polyset_clear(&bases, ctx);
@@ -700,7 +792,7 @@ static int char_set_split(polyset_t *CS, const polyset_t *F, syslist_t *Q,
                         polyset_init(&child);
                         polyset_copy(&child, &P, ctx);
                         polyset_append(&child, bases.p + j, ctx);
-                        syslist_push(Q, &child, ctx);
+                        syslist_push_unique(Q, &child, ctx);
                         polyset_clear(&child, ctx);
                     }
                     g_stat_splits++;
@@ -1038,7 +1130,8 @@ static void wu_solve(const polyset_t *F_orig, sol_list_t *out,
                     if (!polyset_contains(&child, CS.p + j, ctx))
                         polyset_append(&child, CS.p + j, ctx);
                 polyset_append(&child, I, ctx);
-                if (!syslist_contains(&processed, &child, ctx))
+                if (!syslist_contains(&processed, &child, ctx) &&
+                    !syslist_contains(&queue, &child, ctx))
                     syslist_push(&queue, &child, ctx);
                 polyset_clear(&child, ctx);
             }
@@ -1072,8 +1165,8 @@ static int is_prime_ui(ulong n)
 
 int main(int argc, char **argv)
 {
-    const char *vars[] = { "x", "y", "z" };
-    slong nvars = 3;
+    const char *vars[] = { "x", "y", "z", "w" };
+    slong nvars = 4;
     ulong p = 13;
     ulong k = 1;
     int field_reduce = 0;
@@ -1087,7 +1180,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
         {
             printf("用法: %s [k] [p] [-f]\n"
-                   "  k : x^k + y^k + z^k - 5 中的指数 (默认 1)\n"
+                   "  k : x^k + y^k + z^k + w^k - 5 中的指数 (默认 1)\n"
                    "  p : 素数模 (默认 13)\n"
                    "  -f: 开启 x^p = x 指数约化 (只求 F_p 有理点时保值)\n",
                    argv[0]);
@@ -1127,9 +1220,9 @@ int main(int argc, char **argv)
         printf("======  吴特征列方法（完整分解树） / F_%lu, k=%lu%s ======\n",
                (unsigned long) p, (unsigned long) k,
                field_reduce ? ", 指数约化开" : "");
-        printf("变元序: x < y < z\n");
+        printf("变元序: x < y < z < w\n");
 
-        /* f1 = x^k + y^k + z^k - 5 （程序化构造，k 可以很大） */
+        /* f1 = x^k + y^k + z^k + w^k - 5 （程序化构造，k 可以很大） */
         nmod_mpoly_init(f, ctx);
         {
             ulong *exps = (ulong *) calloc(nvars, sizeof(ulong));
@@ -1146,10 +1239,14 @@ int main(int argc, char **argv)
         }
         polyset_append(&F, f, ctx);
 
-        /* f2, f3 */
-        nmod_mpoly_set_str_pretty(f, "x*y + y*z + z*x - 8", vars, ctx);
+        /* f2 = e2, f3 = e3, f4 = e4  （4 变元初等对称多项式） */
+        nmod_mpoly_set_str_pretty(f,
+            "x*y + x*z + x*w + y*z + y*w + z*w - 8", vars, ctx);
         polyset_append(&F, f, ctx);
-        nmod_mpoly_set_str_pretty(f, "x*y*z - 4", vars, ctx);
+        nmod_mpoly_set_str_pretty(f,
+            "x*y*z + x*y*w + x*z*w + y*z*w - 4", vars, ctx);
+        polyset_append(&F, f, ctx);
+        nmod_mpoly_set_str_pretty(f, "x*y*z*w - 1", vars, ctx);
         polyset_append(&F, f, ctx);
         nmod_mpoly_clear(f, ctx);
 
@@ -1177,6 +1274,11 @@ int main(int argc, char **argv)
                (long) g_stat_systems, (long) g_stat_splits,
                (long) g_stat_charsets,
                (double) (t1 - t0) / CLOCKS_PER_SEC);
+        printf("因式分解缓存: 命中 %ld, 未命中 %ld (命中率 %.1f%%)\n",
+               (long) g_fcache_hits, (long) g_fcache_miss,
+               (g_fcache_hits + g_fcache_miss > 0)
+                   ? 100.0 * g_fcache_hits / (g_fcache_hits + g_fcache_miss)
+                   : 0.0);
 
         sol_list_clear(&sols);
         polyset_clear(&F, ctx);
